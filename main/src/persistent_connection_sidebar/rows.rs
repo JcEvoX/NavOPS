@@ -10,9 +10,9 @@ use rust_i18n::t;
 
 use super::drag::DragConnection;
 use super::row_parts::{
-    child_group_button, connection_team_indicator, connection_type_tag, delete_group_button,
-    edit_group_button, tree_chevron, tree_connection_icon_slot, tree_connection_name_with_type_tag,
-    tree_count, tree_label,
+    child_group_button, connection_ai_access_badge, connection_team_indicator, connection_type_tag,
+    delete_group_button, edit_group_button, tree_chevron, tree_connection_icon_slot,
+    tree_connection_name_with_type_tag, tree_count, tree_label,
 };
 use super::tree_model::ConnectionTreeRow;
 use super::{PersistentConnectionSidebar, SidebarPalette};
@@ -325,6 +325,12 @@ impl PersistentConnectionSidebar {
         let team_indicator = connection.as_ref().and_then(|connection| {
             connection_team_indicator(connection, home.read(cx).cached_team_options(), cx)
         });
+        // AI 访问受限时在行尾补一个小徽标；级别来自侧栏缓存的连接字段。
+        let ai_access_badge = connection
+            .as_ref()
+            .and_then(|connection| connection.id)
+            .map(|id| self.ai_access_levels.get(&id).copied().unwrap_or_default())
+            .and_then(|level| connection_ai_access_badge(level, cx));
         let type_tag = connection
             .as_ref()
             .map(|connection| connection_type_tag(connection, cx));
@@ -454,6 +460,7 @@ impl PersistentConnectionSidebar {
             .child(tree_connection_icon_slot(icon, palette))
             .child(tree_connection_name_with_type_tag(name, type_tag))
             .when_some(team_indicator, |row, indicator| row.child(indicator))
+            .when_some(ai_access_badge, |row, badge| row.child(badge))
             .into_any_element()
     }
 }

@@ -318,6 +318,7 @@ dependencies = [
  "serde_json",
  "smol",
  "tokio",
+ "tool_runtime",
  "tracing",
  "uuid",
 ]
@@ -1940,6 +1941,7 @@ dependencies = [
  "one-core",
  "rust-i18n",
  "serde_json",
+ "tool_runtime",
 ]
 
 [[package]]
@@ -3066,6 +3068,7 @@ dependencies = [
  "smol",
  "tokio",
  "tokio-util",
+ "tool_runtime",
  "tracing",
  "uuid",
  "zip 6.0.0",
@@ -8328,6 +8331,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tool_runtime",
  "tracing",
  "url",
 ]
@@ -9362,6 +9366,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "toml 0.8.23",
+ "tool_runtime",
  "tracing",
  "uuid",
  "windows 0.61.3",
@@ -11306,6 +11311,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
+ "tool_runtime",
  "tracing",
 ]
 
@@ -13812,6 +13818,7 @@ dependencies = [
  "terminal",
  "tokio",
  "tokio-util",
+ "tool_runtime",
  "tracing",
  "url",
  "uuid",
