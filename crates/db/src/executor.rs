@@ -41,6 +41,11 @@ pub struct ExecOptions {
     /// 是否启用流式执行（逐条解析执行，适合大文件/大脚本）
     /// 默认 false，会先解析所有语句再执行
     pub streaming: bool,
+    /// 连接在语句发送前就已断开时，是否就地重连该会话并重试一次。
+    ///
+    /// 只对“语句从未发到服务端”的错误生效，所以不会重复执行已生效的写入。
+    /// 显式事务必须保持 `false`：新连接没有事务上下文，静默重试会把语句挪到事务外。
+    pub reconnect_on_lost_connection: bool,
 }
 
 impl Default for ExecOptions {
@@ -50,6 +55,7 @@ impl Default for ExecOptions {
             transactional: false,
             max_rows: Some(1000),
             streaming: false,
+            reconnect_on_lost_connection: false,
         }
     }
 }
@@ -71,6 +77,16 @@ impl SqlResult {
         matches!(self, SqlResult::Error(_))
     }
 
+    /// 该结果是否是“连接在语句发送前就已断开”：本地驱动已判死，一行都没落到数据库。
+    pub fn connection_lost_before_send(&self) -> bool {
+        matches!(self, SqlResult::Error(error) if error.connection_lost_before_send())
+    }
+
+    /// 该结果是否是连接级失败，但无法确定语句是否发出去过。
+    pub fn looks_like_connection_lost(&self) -> bool {
+        matches!(self, SqlResult::Error(error) if error.looks_like_connection_lost())
+    }
+
     /// Restore the parser-provided statement as result metadata after execution-time rewriting.
     pub fn with_original_sql(mut self, sql: impl Into<String>) -> Self {
         let sql = sql.into();
@@ -81,6 +97,40 @@ impl SqlResult {
         }
         self
     }
+}
+
+/// 断连发生在语句发送之前的错误文案（全小写匹配）。
+///
+/// 这些是驱动在本地就判定连接已死时给出的文案，语句根本没有发出，所以重放不会
+/// 重复执行。中途断连的文案（`broken pipe` / `unexpected eof` / `connection reset`
+/// / `server closed the connection unexpectedly`）不在其中：那时语句可能已经生效。
+const PRE_SEND_CLOSED_NEEDLES: [&str; 4] = [
+    "connection closed",
+    "client is closed",
+    "connection is closed",
+    "to the server is closed",
+];
+
+/// 看起来像连接已断、但无法确定语句是否已经发出的错误文案（全小写匹配）。
+const LOST_CONNECTION_NEEDLES: [&str; 10] = [
+    "connection has been closed",
+    "server closed the connection",
+    "connection reset",
+    "error communicating with the server",
+    "broken pipe",
+    "unexpected eof",
+    "early eof",
+    "lost connection",
+    "gone away",
+    "not connected",
+];
+
+/// 连接在语句发送前就已断开：语句从未发到服务端，可以安全地重连重放。
+pub fn connection_lost_before_send_message(message: &str) -> bool {
+    let message = message.to_lowercase();
+    PRE_SEND_CLOSED_NEEDLES
+        .iter()
+        .any(|needle| message.contains(needle))
 }
 
 /// Column metadata for query results
@@ -640,6 +690,30 @@ pub struct SqlErrorInfo {
     pub message: String,
 }
 
+impl SqlErrorInfo {
+    /// 连接在语句发送前就已断开：本地驱动已确认连接死了，语句从未发到服务端。
+    ///
+    /// 只有这一类断连可以安全地“重连 + 重放”：驱动还没把语句写进 socket，
+    /// 重放不会重复执行已经生效的写入。
+    pub fn connection_lost_before_send(&self) -> bool {
+        connection_lost_before_send_message(&self.message)
+    }
+
+    /// 错误文本像“连接已断”，但无法确定语句是否已经发出去。
+    ///
+    /// 持有会话的一方（粘性查询会话、手动事务、表数据会话）据此丢弃并重建会话；
+    /// 不要用它来决定重试——语句可能已经生效。
+    pub fn looks_like_connection_lost(&self) -> bool {
+        if self.connection_lost_before_send() {
+            return true;
+        }
+        let message = self.message.to_lowercase();
+        LOST_CONNECTION_NEEDLES
+            .iter()
+            .any(|needle| message.contains(needle))
+    }
+}
+
 mod elapsed_ms_serde {
     use serde::{Deserialize, Deserializer, Serializer};
 
@@ -937,6 +1011,84 @@ mod tests {
             };
             assert_eq!(original_sql, actual_sql);
         }
+    }
+
+    fn error_info(message: &str) -> SqlErrorInfo {
+        SqlErrorInfo {
+            sql: "select 1".to_string(),
+            message: message.to_string(),
+        }
+    }
+
+    /// 只有驱动在本地判死的文案才算“语句没发出去”，可以重连重放。
+    #[test]
+    fn connection_lost_before_send_matches_pre_send_closed_messages() {
+        for message in [
+            "connection closed",
+            "Connection closed",
+            "client is closed",
+            "the connection is closed",
+            // tiberius（SQL Server）在连接池关闭后给出的文案
+            "Connection to the server is closed",
+            "error: connection closed while waiting for the server",
+        ] {
+            assert!(
+                error_info(message).connection_lost_before_send(),
+                "{message} 应当判为发送前断连"
+            );
+            assert!(error_info(message).looks_like_connection_lost());
+        }
+    }
+
+    /// 中途断连可能已经写成功：只能回收会话，不能重放语句。
+    #[test]
+    fn connection_lost_before_send_rejects_mid_flight_disconnects() {
+        for message in [
+            "server closed the connection unexpectedly",
+            "error communicating with the server: broken pipe",
+            "connection reset by peer",
+            "unexpected eof",
+            "Lost connection to MySQL server during query",
+            "MySQL server has gone away",
+            "ORA-03114: not connected to ORACLE",
+        ] {
+            assert!(
+                !error_info(message).connection_lost_before_send(),
+                "{message} 不能判为发送前断连"
+            );
+            assert!(
+                error_info(message).looks_like_connection_lost(),
+                "{message} 应当仍然让持有会话的一方丢弃会话"
+            );
+        }
+    }
+
+    /// 普通 SQL 错误不能被当成连接丢失，否则会在错误上反复重建会话。
+    #[test]
+    fn ordinary_statement_errors_are_not_connection_losses() {
+        for message in [
+            "relation \"users\" does not exist",
+            "duplicate key value violates unique constraint \"users_pkey\"",
+            "You have an error in your SQL syntax",
+            "canceling statement due to statement timeout",
+        ] {
+            assert!(!error_info(message).connection_lost_before_send());
+            assert!(!error_info(message).looks_like_connection_lost());
+        }
+    }
+
+    #[test]
+    fn sql_result_reports_connection_loss_only_for_error_rows() {
+        assert!(SqlResult::Error(error_info("connection closed")).connection_lost_before_send());
+        assert!(
+            !SqlResult::Exec(ExecResult {
+                sql: "select 1".to_string(),
+                rows_affected: 0,
+                elapsed_ms: 0,
+                message: None,
+            })
+            .looks_like_connection_lost()
+        );
     }
 }
 
