@@ -806,11 +806,8 @@ impl RedisFormWindow {
                         // 连接本身已经保存成功，只有「AI 访问」策略没写进去。这条失败必须可见：
                         // 保存发生在窗口关闭之后，表单里的错误行只有窗口被保留时才看得到，
                         // 所以除了错误行还要在活动窗口上弹一条通知，并把原文记进日志。
-                        let message = t!(
-                            "ConnectionForm.ai_access_save_failed",
-                            error = ai_access_error
-                        )
-                        .to_string();
+                        let message =
+                            connection_form::ai_access::ai_access_save_failed(&ai_access_error);
                         error!("{message}");
                         let _ = this.update(cx, |form, cx| {
                             form.test_result = Some(Err(message.clone()));
@@ -822,7 +819,7 @@ impl RedisFormWindow {
                 Err(e) => {
                     error!(
                         "{}",
-                        t!("Redis.save_connection_failed", error = e).to_string()
+                        t!("ConnectionForm.save_connection_failed", error = e).to_string()
                     );
                 }
             }
@@ -937,7 +934,7 @@ impl RedisFormWindow {
             })
             // 连接级 AI 访问策略（issue #437）：布局与选项由通用组件统一渲染。
             .child(self.render_form_row(
-                &t!("ConnectionForm.ai_access"),
+                &connection_form::ai_access::ai_access_label(),
                 connection_form::ai_access::ai_access_selector(&self.ai_access_level, cx),
             ))
     }

@@ -2310,7 +2310,7 @@ impl SshFormWindow {
                 let error_msg = if let Some(id) = persisted_id {
                     self.is_editing = true;
                     self.editing_id = Some(id);
-                    t!("ConnectionForm.ai_access_save_failed", error = e).to_string()
+                    connection_form::ai_access::ai_access_save_failed(&e)
                 } else {
                     t!("SSH.save_failed", error = e).to_string()
                 };
@@ -2924,7 +2924,7 @@ impl SshFormWindow {
             })
             // 连接级 AI 访问策略（issue #437）：布局与选项由通用组件统一渲染。
             .child(self.render_form_row(
-                &t!("ConnectionForm.ai_access"),
+                &connection_form::ai_access::ai_access_label(),
                 connection_form::ai_access::ai_access_selector(&self.ai_access_level, cx),
             ))
     }

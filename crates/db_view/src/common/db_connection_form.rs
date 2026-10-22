@@ -2335,8 +2335,7 @@ impl DbConnectionForm {
                             }
                             Err(e) => {
                                 let error_msg =
-                                    t!("ConnectionForm.ai_access_save_failed", error = e)
-                                        .to_string();
+                                    connection_form::ai_access::ai_access_save_failed(&e);
                                 let _ = this.update(cx, |form, cx| {
                                     form.set_save_error(error_msg.clone(), cx);
                                     cx.emit(DbConnectionFormEvent::SaveError(error_msg));

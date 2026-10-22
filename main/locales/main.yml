@@ -2358,6 +2358,15 @@ NewConnection:
     en: "More Connections"
     zh-CN: "更多连接"
     zh-HK: "更多連線"
+  # 空类目的「+」安装入口（见 NewConnectionCategory::InstallCategoryExtensions）
+  more_middleware:
+    en: "More middleware"
+    zh-CN: "更多中间件"
+    zh-HK: "更多中介軟體"
+  more_time_series:
+    en: "More time series"
+    zh-CN: "更多时序数据库"
+    zh-HK: "更多時序資料庫"
   description_ssh:
     en: Remote server terminal and file connection
     zh-CN: 远程服务器终端与文件连接
@@ -5442,3 +5451,15 @@ CredentialForm:
     en: Save
     zh-CN: 保存
     zh-HK: 儲存
+
+# FTP 连接表单的窗口标题由本 crate 组装（表单本体在 terminal_view 的 ftp_form_window），
+# 标题文案必须留在 main 自己的语言包里。
+Ftp:
+  new:
+    en: New FTP Connection
+    zh-CN: 新建 FTP 连接
+    zh-HK: 新建 FTP 連接
+  edit:
+    en: Edit FTP Connection
+    zh-CN: 编辑 FTP 连接
+    zh-HK: 編輯 FTP 連接
