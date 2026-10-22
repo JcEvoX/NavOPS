@@ -1520,6 +1520,13 @@ impl TableDesigner {
     }
 
     fn render_toolbar(&self, cx: &Context<Self>) -> AnyElement {
+        // 只有预览类和 DDL 页签有可复制的 SQL，其它页签不摆这个按钮。
+        let preview_source = match self.active_tab {
+            DesignerTab::SqlPreview => Some(&self.sql_preview_input),
+            DesignerTab::Ddl => Some(&self.ddl_preview_input),
+            _ => None,
+        };
+
         h_flex()
             .px_3()
             .py_2()
@@ -1553,6 +1560,9 @@ impl TableDesigner {
                     .child(Input::new(&self.table_comment_input).w(px(300.))),
             )
             .child(div().flex_1())
+            .when_some(preview_source, |this, source| {
+                this.child(self.render_copy_action(PREVIEW_COPY_SELECTOR, source, cx))
+            })
             .child(
                 Button::new("execute")
                     .primary()
@@ -1608,7 +1618,7 @@ impl TableDesigner {
             DesignerTab::Indexes => self.indexes_editor.clone().into_any_element(),
             DesignerTab::Options => self.render_options(cx),
             DesignerTab::SqlPreview => self.render_sql_preview(cx),
-            DesignerTab::Ddl => self.render_ddl_preview(cx),
+            DesignerTab::Ddl => self.render_ddl_preview(),
         }
     }
 
@@ -1688,61 +1698,46 @@ impl TableDesigner {
             .size_full()
             .p_4()
             .gap_3()
-            .child(
-                h_flex()
-                    .w_full()
-                    .items_center()
-                    .gap_2()
-                    .when(self.sql_preview_loading, |this| {
-                        this.child(Spinner::new().with_size(Size::Small)).child(
+            .when(self.sql_preview_loading, |this| {
+                this.child(
+                    h_flex()
+                        .w_full()
+                        .items_center()
+                        .gap_2()
+                        .child(Spinner::new().with_size(Size::Small))
+                        .child(
                             div()
                                 .text_sm()
                                 .text_color(cx.theme().muted_foreground)
                                 .child(t!("Table.generating_sql_preview").to_string()),
-                        )
-                    })
-                    .child(div().flex_1())
-                    .child(self.render_copy_action(
-                        SQL_PREVIEW_COPY_SELECTOR,
-                        &self.sql_preview_input,
-                        cx,
-                    )),
-            )
+                        ),
+                )
+            })
             .child(
                 Editor::new(&self.sql_preview_input)
                     .size_full()
-                    .disabled(true),
+                    .readonly(true),
             )
             .into_any_element()
     }
 
-    fn render_ddl_preview(&self, cx: &Context<Self>) -> AnyElement {
+    fn render_ddl_preview(&self) -> AnyElement {
         v_flex()
             .size_full()
             .p_4()
             .gap_3()
             .child(
-                h_flex()
-                    .w_full()
-                    .justify_end()
-                    .child(self.render_copy_action(
-                        DDL_PREVIEW_COPY_SELECTOR,
-                        &self.ddl_preview_input,
-                        cx,
-                    )),
-            )
-            .child(
                 Editor::new(&self.ddl_preview_input)
                     .size_full()
-                    .disabled(true),
+                    .readonly(true),
             )
             .into_any_element()
     }
 
-    /// 预览类页签的复制入口。
+    /// 预览类页签的复制入口，摆在工具栏「保存」旁边。
     ///
-    /// 这些页签的编辑器是禁用态，不能像普通编辑器那样选中复制，所以各自给一个
-    /// 显式按钮；没有可复制的 SQL 时置灰，避免复制出空内容。
+    /// 编辑器虽然是只读的（可以选中、复制），但整段 SQL 一键取走更省事；
+    /// 没有可复制的 SQL 时置灰，避免复制出空内容。
     fn render_copy_action(
         &self,
         selector: &'static str,
@@ -1759,8 +1754,8 @@ impl TableDesigner {
                     .small()
                     .ghost()
                     .icon(IconName::Copy)
-                    .label(t!("Query.copy_sql").to_string())
-                    .tooltip(t!("Query.copy_sql").to_string())
+                    .label(t!("Table.copy_sql").to_string())
+                    .tooltip(t!("Table.copy_sql").to_string())
                     .disabled(!can_copy)
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.copy_preview_sql(&source, window, cx);
@@ -1782,7 +1777,7 @@ impl TableDesigner {
         };
 
         cx.write_to_clipboard(item);
-        window.push_notification(t!("Query.sql_copied").to_string(), cx);
+        window.push_notification(t!("Table.sql_copied").to_string(), cx);
     }
 }
 
@@ -1808,10 +1803,10 @@ impl Render for TableDesigner {
     }
 }
 
-/// SQL 预览页签复制按钮的调试选择器（供回归测试定位该按钮）。
-const SQL_PREVIEW_COPY_SELECTOR: &str = "table-designer-copy-sql-preview";
-/// DDL 页签复制按钮的调试选择器（供回归测试定位该按钮）。
-const DDL_PREVIEW_COPY_SELECTOR: &str = "table-designer-copy-ddl";
+/// 工具栏复制按钮的调试选择器（供回归测试定位该按钮）。
+///
+/// 一个按钮服务两个页签：当前页签是 SQL 预览就复制预览，是 DDL 就复制 DDL。
+const PREVIEW_COPY_SELECTOR: &str = "table-designer-copy-preview";
 
 /// 表结构加载面板的调试选择器（供回归测试定位该面板）。
 const STRUCTURE_LOADING_SELECTOR: &str = "table-designer-structure-loading";
@@ -5922,17 +5917,14 @@ mod tests {
         );
     }
 
-    /// 预览和 DDL 页签的编辑器都是禁用态，不能像普通编辑器那样选中复制，
-    /// 所以两个页签各自要有一个显式的复制按钮。
+    /// 复制按钮跟着页签走：预览类和 DDL 页签在「保存」左边出现一个，
+    /// 其它页签没有可复制的 SQL，就不摆这个按钮。
     #[gpui::test]
-    fn the_sql_preview_and_ddl_tabs_each_offer_a_copy_action(cx: &mut gpui::TestAppContext) {
+    fn the_copy_action_follows_the_preview_and_ddl_tabs(cx: &mut gpui::TestAppContext) {
         const SQL: &str = "CREATE TABLE `users` (\n  `id` INT\n);";
         let (designer, _armed_at_open, visual) = designer_window(cx, None);
 
-        for (tab, selector) in [
-            (DesignerTab::SqlPreview, SQL_PREVIEW_COPY_SELECTOR),
-            (DesignerTab::Ddl, DDL_PREVIEW_COPY_SELECTOR),
-        ] {
+        for tab in [DesignerTab::SqlPreview, DesignerTab::Ddl] {
             visual.update(|window, cx| {
                 designer.update(cx, |designer, cx| {
                     designer.active_tab = tab.clone();
@@ -5950,10 +5942,87 @@ mod tests {
             });
 
             assert!(
-                visual.debug_bounds(selector).is_some(),
-                "{tab:?} 页签应当渲染复制按钮"
+                visual.debug_bounds(PREVIEW_COPY_SELECTOR).is_some(),
+                "{tab:?} 页签应当在工具栏渲染复制按钮"
             );
         }
+
+        visual.update(|window, cx| {
+            designer.update(cx, |designer, cx| {
+                designer.active_tab = DesignerTab::Columns;
+                cx.notify();
+            });
+            window.draw(cx).clear(cx);
+        });
+
+        assert!(
+            visual.debug_bounds(PREVIEW_COPY_SELECTOR).is_none(),
+            "列页签没有可复制的 SQL，不该渲染复制按钮"
+        );
+    }
+
+    /// 复制按钮的词条必须真实存在。
+    ///
+    /// 词条写错时 `t!` 会退回字面 key 直接画在按钮上（用户看到的就是
+    /// 「Query.copy_sql」），这类错误编译和渲染都不会报。
+    #[test]
+    fn the_copy_action_wording_is_translated() {
+        for key in ["Table.copy_sql", "Table.sql_copied"] {
+            assert_ne!(key, t!(key).as_ref(), "词条 `{key}` 缺失");
+        }
+    }
+
+    /// 两个预览页签的编辑器都必须只读而不是禁用：禁用态收不到选区，
+    /// 用户就没法自己在编辑器里选中片段复制。
+    #[test]
+    fn preview_editors_are_readonly_so_text_can_be_selected() {
+        let source = include_str!("table_designer_tab.rs");
+
+        for (name, field) in [
+            ("render_sql_preview", "sql_preview_input"),
+            ("render_ddl_preview", "ddl_preview_input"),
+        ] {
+            let body = function_body(source, name);
+            assert!(
+                body.contains(&format!("Editor::new(&self.{field})")),
+                "{name} 应当渲染 {field} 的编辑器"
+            );
+            assert!(
+                body.contains(".readonly(true)"),
+                "{name} 的编辑器要只读，才能选中复制"
+            );
+            assert!(
+                !body.contains(".disabled(true)"),
+                "{name} 的编辑器不能是禁用态，否则选区都拿不到"
+            );
+        }
+    }
+
+    /// 工具栏里复制按钮摆在「保存」左边，而不是预览区里单独占一行。
+    #[test]
+    fn the_copy_action_sits_next_to_the_save_button_in_the_toolbar() {
+        let toolbar = function_body(include_str!("table_designer_tab.rs"), "render_toolbar");
+
+        let copy_at = toolbar
+            .find("render_copy_action(PREVIEW_COPY_SELECTOR")
+            .expect("工具栏要渲染复制按钮");
+        let save_at = toolbar
+            .find("Button::new(\"execute\")")
+            .expect("工具栏要有保存按钮");
+
+        assert!(
+            copy_at < save_at,
+            "复制按钮要放在保存按钮旁边（保存左边），而不是页签内容区"
+        );
+    }
+
+    /// 截出 `fn <name>(` 的实现体，断言只看实现，不看别处。
+    fn function_body<'a>(source: &'a str, name: &str) -> &'a str {
+        let needle = format!("fn {name}(");
+        let start = source.find(&needle).expect("function implementation");
+        let body = &source[start..];
+        let end = body.find("\n    fn ").expect("next method");
+        &body[..end]
     }
 
     /// 构造表设计器窗口，返回 (designer, 打开瞬间是否在加载态, visual)。

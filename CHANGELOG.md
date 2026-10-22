@@ -4,6 +4,62 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 <!-- NAVOP_RELEASES -->
 
+## [v0.21.0] - 2026-10-22
+
+#### 更新内容
+
+- 连接新增「AI 访问」策略（允许 / 只读 / 禁止），决定 AI 能否操作这条连接。策略分三层生效：被禁止的连接不进 AI 的资源目录、`connections.list` / `find` 也不返回；只读连接只保留读类工具；真正执行时统一复核 `connection`、`connection_id`、`target`、`session_id`，内置对话与外部 MCP 客户端共用同一道闸门，写操作直接拒绝而不是静默放宽。策略属于连接内容，随连接一起云同步，换机器后限制依然生效；侧栏徽标与右键菜单可以直接切换（#437）。
+- 扩展连接支持自定义图标：连接表单可选内置图标或本地图片，未选择时回退到扩展 manifest 声明的图标，表单与 manifest 也新增了 `Icon` 字段类型供扩展自带图标选择器。连接列表、卡片与终端标签页改用同一套解析，标签页不再一律显示通用图标——SSH 连接设置过的自定义图标现在也会出现在标签上（#438）。
+- AI 对话的模型下拉在选项超过 15 个时（例如 OpenRouter 这类聚合供应商的数百个模型）顶部出现搜索框，按供应商、模型名与提示词做不区分大小写的模糊过滤，模型名以关键字开头的排在前面；列表限高滚动，无匹配时显示空态（#405）。
+- 首页的「最近连接」分组现在可以关掉：设置 → 通用 →「连接显示」新增开关，关闭后首页只显示各分组内的连接，重启也不会再自己冒出来（#388）。
+- SQL 查询结果可以按来源补全字段注释：开启「列头显示字段注释」时，会分析查询涉及的基表、连接与别名，把源字段的注释映射到结果列；分析不完整时退化为「列名在候选表中唯一」的保守匹配，无法唯一确定就不显示，避免张冠李戴（#428）。
+- SQL 执行多了明确的运行态：发起后结果面板立即切到「运行中」并强制可见，工具栏同步显示旋转指示与「运行中...」，运行时间从执行开始就持续走动，大查询期间不会再看着像「点了没反应」。建立 Auto 会话与手动事务的建连阶段同样计入运行中，在这一阶段点取消会真正作废本次执行（#427）。
+
+#### 修复与优化
+
+- ClickHouse 改为扩展驱动（升级需先安装驱动）：内置插件已移除，连接、打开与表单统一走扩展市场的 clickhouse 驱动。历史连接记录仍然保留，但需要先安装该驱动才能打开；未安装时按 DuckDB / TDengine 的同一策略提示安装，新建入口在驱动安装后才出现（#436）。
+- 数据库：Auto（粘性）会话在空闲期被服务端或防火墙掐断后，不必再关掉连接重开。此前驱动把断连包成正常结果，断连信号只在错误时置位，编辑器于是一直复用死连接，每条语句都在几毫秒内失败。现在若整批结果都表明「语句还没发出去就已断连」，会就地替换会话的物理连接并重试一次，会话 id、页签状态与记住的 schema 都保留；中途断连（broken pipe / unexpected EOF）与手动事务不重试，避免语句被重放成重复写入（#447）。
+- 数据库：修复 Auto 模式选中 schema 后未限定表名的查询仍落在 `public`。建会话时只传了 database、没把 search_path 对齐到下拉框选中的 schema，后续执行又不会重放切换，选择形同无效；现在会话建立后先切 schema 再执行，且只在建会话时切一次，不覆盖用户手动的 `SET search_path`（#433）。
+- 数据库：结果操作（复制为 INSERT / UPDATE / DELETE）不再把表名拼成 `schema.schema.table` 导致执行报错——查询分析给出的表名本身可能已带 schema 前缀（#400）。
+- 笔记：打开外部 Markdown 文件后，文中的相对路径图片现在能正常渲染。此前编辑器创建时没有绑定文件路径，图片基准目录退回进程工作目录；现在打开即绑定绝对路径，在笔记内重命名文档时也会同步更新（#448）。
+- 设置 → MCP：「安装 Navop Skill」不再在 macOS 上以 `No such file or directory (os error 2)` 失败。从 Finder / Dock 启动的 GUI 进程只继承最小 PATH，裸调 `npx` 找不到，而 `npx` 的 shebang 还需要 `node`；现在按 PATH 加上 Homebrew、`/usr/local`、nvm / fnm / volta / asdf 等兜底目录解析启动器，并把所在目录补进子进程 PATH。MCP 运行时的要求状态改为真实探测，找不到启动器时给出可操作提示，而不是无条件显示「已就绪」（#449）。
+- 连接树分成「最近连接 / 分组 / 未分组」三段，未分组的连接不再堆在文件夹列表末尾，分区标题带计数，「最近连接」与「未分组」分区可折叠；分组同级排序统一为「自定义顺序 + 名称自然序」，修掉新建分组后层级与顺序漂移的问题。
+- 删除分组改为「提升一层」：子分组与直属连接迁移到被删分组的父级，不再凭空消失或跳到根级；右键「移动到分组」改成按层级展开的子菜单，同名分组会补上父路径，分组过多时给出提示。
+- 终端：SSH / 串口断开或 shell 已退出后，`Ctrl+D` 可以关闭当前标签页（单窗格关闭整页、分屏只关当前窗格、独立窗口关闭窗口），会话存活时 `Ctrl+D` 仍照常透传 EOF。此前该分支只判断终端类型是否支持实时输入，SSH 断开后这个值仍为 true，按键根本命中不到关闭逻辑。
+- 终端：分屏窗格的尺寸在切到其它标签再切回来时保持原比例，不再重新均分——尺寸此前只存在窗口元素缓存里，标签切走就丢了。
+- 终端：macOS 上粘贴到远程 bash 偶尔冒出 `[200~` 字面文本的问题已修复。此前按渲染帧快照判断是否用 bracketed paste 包装，而 bash 5.1+ 每次执行命令都会翻转该模式，快照滞后就会拿过期状态去包装；现在读取终端的实时模式，只有锁被解析线程占用时才回退快照（#198）。
+- 表设计器：SQL 预览与 DDL 页签可以复制 SQL，按钮移到工具栏紧邻「保存」，内容为空时置灰；两个页签的编辑器由禁用改为只读，可以直接选中片段复制，顺带修掉提示文案直接显示字面 key 的问题。
+
+国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.21.0) 下载桌面端安装包
+
+---
+
+#### What's New
+
+- Connections now carry an "AI Access" policy (Allowed / Read only / Denied) that decides whether AI may operate them. It applies in three layers: denied connections stay out of the AI resource catalog and are not returned by `connections.list` / `find`; read-only connections keep only read tools; and one guard re-checks `connection`, `connection_id`, `target` and `session_id` at execution time, shared by the built-in chat and external MCP clients, so writes are rejected outright instead of silently allowed. The policy is part of the connection, so it syncs to the cloud with the connection and still holds on another machine; the sidebar badge and context menu switch it directly (#437).
+- Extension connections support custom icons: the connection form offers built-in icons or a local image, falling back to the icon declared in the extension manifest, and forms and manifests gain an `Icon` field type so extensions can ship their own picker. Connection lists, cards and terminal tabs now share one resolution path, so tabs no longer always show the generic icon — an SSH connection's custom icon now appears on its tab as well (#438).
+- The model dropdown in AI chat shows a search box once it has more than 15 entries (OpenRouter and similar aggregators carry hundreds of models), filtering case-insensitively on provider, model name and hint and ranking model names that start with the query first; the list scrolls within a fixed height and shows an empty state when nothing matches (#405).
+- The home "Recent Connections" section can now be turned off: Settings → General → Connection display adds a switch, and with it off the home page lists only the connections inside their groups — it stays off after a restart (#388).
+- SQL results can now fill in column comments from their sources: with "show column comments in header" enabled, the query's base tables, joins and aliases are analyzed and source comments are mapped onto the result columns; when the analysis is incomplete it degrades to the conservative "column name is unique across the candidate tables" match and shows nothing rather than a comment it cannot attribute correctly (#428).
+- SQL execution now has a clear running state: the result panel switches to running and stays visible, the toolbar shows a spinner and "Running...", and the elapsed time starts ticking immediately, so a long query no longer looks like it was ignored. Establishing an Auto session or a manual transaction counts as running too, and cancelling during that phase really aborts the run (#427).
+
+#### Fixes and Improvements
+
+- ClickHouse now runs on an extension driver, and upgrading requires installing that driver: the built-in plugin is gone, so connecting, opening and forms go through the clickhouse driver from the extension market. Existing connection records are kept but need the driver installed before they can open; when it is missing the app offers to install it, following the same policy as DuckDB / TDengine, and the new-connection entry only appears once the driver is installed (#436).
+- Database: an Auto (sticky) session dropped while idle by the server or a firewall no longer requires closing and reopening the connection. The drivers report a disconnect as an ordinary result, the lost-connection signal was only raised on errors, and the editor kept reusing the dead connection so every statement failed within milliseconds. When an entire batch shows the statement never left the client, the session's physical connection is now replaced in place and the run retried once, keeping the session id, tab state and remembered schema; mid-flight disconnects (broken pipe / unexpected EOF) and manual transactions are not retried, so statements cannot be replayed into duplicate writes (#447).
+- Database: fixed unqualified queries landing in `public` even after a schema was picked in Auto mode. Session setup passed only the database and never aligned the search_path with the schema selected in the dropdown, and later runs do not replay the switch, so the choice had no effect; the schema is now switched before the run, once per session, without overriding a manual `SET search_path` (#433).
+- Database: result actions (copy as INSERT / UPDATE / DELETE) no longer build `schema.schema.table` and fail on execution — the table name coming from query analysis may already carry its schema prefix (#400).
+- Notes: images referenced by relative path now render when an external Markdown file is opened. The editor was created without a file path, so the image base directory fell back to the process working directory; it is now bound to the absolute path on open and updated when the document is renamed inside the app (#448).
+- Settings → MCP: "Install Navop Skill" no longer fails with `No such file or directory (os error 2)` on macOS. A GUI process launched from Finder or Dock inherits a minimal PATH, so a bare `npx` cannot be found — and `npx`'s shebang needs `node` — so the launcher is now resolved through PATH plus fallback directories (Homebrew, `/usr/local`, nvm / fnm / volta / asdf) and its directory is added to the child process PATH. The MCP runtime requirement status is probed for real now, with actionable guidance when the launcher is missing instead of an unconditional "ready" (#449).
+- The connection tree separates Recent connections / Groups / Unassigned, so ungrouped connections no longer pile up at the end of the folder list, and each section header shows a count, with the Recent and Unassigned sections collapsible. Sibling groups now sort consistently by custom order then natural name, fixing the hierarchy and order drifting after a new group was created.
+- Deleting a group now lifts its contents one level: child groups and direct connections move to the deleted group's parent instead of vanishing or jumping to the root. "Move to group" became a hierarchical submenu, with the parent path added to same-named groups and a hint when there are many of them.
+- Terminal: after an SSH or serial disconnect, or once the shell has exited, `Ctrl+D` closes the current tab (the whole tab for a single pane, only the focused pane in a split, and the window for a standalone terminal), while a live session still passes `Ctrl+D` through as EOF. The old branch only checked whether the terminal type accepts live input, which stays true after an SSH disconnect, so the key never reached the close logic.
+- Terminal: split pane sizes keep their proportions after switching to another tab and back instead of being reset to equal shares — the sizes only lived in the window element cache and were dropped when the tab was unmounted.
+- Terminal: pasting into a remote bash on macOS no longer occasionally leaks a literal `[200~`. The paste path used a rendering snapshot to decide whether to wrap the text in a bracketed-paste sequence, but bash 5.1+ toggles that mode around every command, so a stale snapshot wrapped when the remote had it off; the live terminal mode is now read directly, falling back to the snapshot only while the parser holds the lock (#198).
+- Table designer: the SQL preview and DDL tabs can copy their SQL, with the button moved to the toolbar next to Save and greyed out when there is nothing to copy; both editors became read-only rather than disabled so fragments can be selected, and the notice no longer displays a raw locale key.
+
+**Full Changelog**: https://github.com/feigeCode/navop/compare/v0.20.4...v0.21.0
+
 ## [v0.20.4] - 2026-10-20
 
 #### 更新内容
