@@ -51,6 +51,8 @@ pub(crate) enum TerminalDuplicateSource {
     Launched {
         config: LocalConfig,
         title: String,
+        /// 连接设置里选的图标;复制标签时一并带上。
+        icon: Option<Icon>,
     },
     Ssh {
         connection: StoredConnection,
@@ -136,6 +138,17 @@ impl TerminalView {
             && terminal.ssh_mfa_request().is_none()
             && terminal.host_key_verification_request().is_none()
             && !terminal.is_locked()
+    }
+
+    /// 粘贴路径的实时终端模式。
+    ///
+    /// 代理到 `resolve_live_term_mode`（见 helpers.rs），集中维护
+    /// 「实时读取 + 快照回退」语义，避免各粘贴入口散落 try_lock。
+    pub(super) fn live_term_mode(&self, cx: &App) -> TermMode {
+        resolve_live_term_mode(
+            self.terminal.read(cx).term(),
+            self.terminal_frame_snapshot.mode,
+        )
     }
 
     pub(super) fn has_blocking_auth_prompt(&self, cx: &App) -> bool {
