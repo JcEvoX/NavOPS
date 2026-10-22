@@ -14,6 +14,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex};
 
 use super::rdp_settings::RdpSettings;
+use tool_runtime::AiAccessLevel;
 
 /// 活跃连接状态 - 用于跟踪哪些连接当前已打开
 #[derive(Clone, Default)]
@@ -2069,6 +2070,9 @@ pub struct StoredConnection {
     /// 打开方式偏好（None = 按类型默认：SSH 终端、FTP 双栏）
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub preferred_open_mode: Option<PreferredOpenMode>,
+    /// AI 访问策略（默认允许）：属于连接内容，随连接一起云同步、一起导入导出。
+    #[serde(default)]
+    pub ai_access_level: AiAccessLevel,
 }
 
 pub const EXTENSION_CONNECTION_SCHEMA_VERSION: u32 = 1;
@@ -2301,6 +2305,7 @@ impl StoredConnection {
     ) -> Self {
         let name = trimmed_or_default(name, params.contribution_id.clone());
         Self {
+            ai_access_level: AiAccessLevel::Allowed,
             id: None,
             credential_revision: None,
             name,
@@ -2375,6 +2380,7 @@ impl StoredConnection {
     ) -> Self {
         let name = default_database_name(name, &params);
         Self {
+            ai_access_level: AiAccessLevel::Allowed,
             id: None,
             credential_revision: None,
             name,
@@ -2404,6 +2410,7 @@ impl StoredConnection {
         params.sanitize_for_storage();
         let name = default_ssh_name(name, &params);
         Self {
+            ai_access_level: AiAccessLevel::Allowed,
             id: None,
             credential_revision: None,
             name,
@@ -2432,6 +2439,7 @@ impl StoredConnection {
         params.sanitize_for_storage();
         let name = default_ftp_name(name, &params);
         Self {
+            ai_access_level: AiAccessLevel::Allowed,
             id: None,
             credential_revision: None,
             name,
@@ -2460,6 +2468,7 @@ impl StoredConnection {
     ) -> Self {
         let name = default_remote_desktop_name(name, &params);
         Self {
+            ai_access_level: AiAccessLevel::Allowed,
             id: None,
             credential_revision: None,
             name,
@@ -2484,6 +2493,7 @@ impl StoredConnection {
     pub fn new_redis(name: String, params: RedisParams, workspace_id: Option<i64>) -> Self {
         let name = default_redis_name(name, &params);
         Self {
+            ai_access_level: AiAccessLevel::Allowed,
             id: None,
             credential_revision: None,
             name,
@@ -2508,6 +2518,7 @@ impl StoredConnection {
     pub fn new_mongodb(name: String, params: MongoDBParams, workspace_id: Option<i64>) -> Self {
         let name = default_mongodb_name(name, &params);
         Self {
+            ai_access_level: AiAccessLevel::Allowed,
             id: None,
             credential_revision: None,
             name,
@@ -2532,6 +2543,7 @@ impl StoredConnection {
     pub fn new_mqtt(name: String, params: MqttParams, workspace_id: Option<i64>) -> Self {
         let name = default_mqtt_name(name, &params);
         Self {
+            ai_access_level: AiAccessLevel::Allowed,
             id: None,
             credential_revision: None,
             name,
@@ -2597,6 +2609,7 @@ impl StoredConnection {
     pub fn new_serial(name: String, params: SerialParams, workspace_id: Option<i64>) -> Self {
         let name = default_serial_name(name, &params);
         Self {
+            ai_access_level: AiAccessLevel::Allowed,
             id: None,
             credential_revision: None,
             name,
@@ -2621,6 +2634,7 @@ impl StoredConnection {
     pub fn new_telnet(name: String, params: TelnetParams, workspace_id: Option<i64>) -> Self {
         let name = default_telnet_name(name, &params);
         Self {
+            ai_access_level: AiAccessLevel::Allowed,
             id: None,
             credential_revision: None,
             name,
@@ -2649,6 +2663,7 @@ impl StoredConnection {
     ) -> Self {
         let name = default_port_forwarding_name(name, &params);
         Self {
+            ai_access_level: AiAccessLevel::Allowed,
             id: None,
             credential_revision: None,
             name,

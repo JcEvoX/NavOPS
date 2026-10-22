@@ -60,6 +60,7 @@ mod tests {
 
     fn searched_team_ssh() -> StoredConnection {
         StoredConnection {
+            ai_access_level: Default::default(),
             id: Some(50),
             credential_revision: Some(1),
             name: "186华为云服务器".to_string(),

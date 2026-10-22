@@ -1773,6 +1773,38 @@ Connection:
     en: "Fullscreen mode. Press Esc to exit fullscreen."
     zh-CN: "已进入全屏，按 Esc 退出全屏。"
     zh-HK: "已進入全螢幕，按 Esc 退出全螢幕。"
+  ai_access:
+    en: AI Access
+    zh-CN: AI 访问
+    zh-HK: AI 存取
+  ai_access_allowed:
+    en: Allowed
+    zh-CN: 允许
+    zh-HK: 允許
+  ai_access_read_only:
+    en: Read only
+    zh-CN: 只读
+    zh-HK: 唯讀
+  ai_access_denied:
+    en: Denied
+    zh-CN: 禁止
+    zh-HK: 禁止
+  ai_access_read_only_badge:
+    en: AI read-only
+    zh-CN: AI 只读
+    zh-HK: AI 唯讀
+  ai_access_denied_badge:
+    en: AI blocked
+    zh-CN: 禁止 AI
+    zh-HK: 禁止 AI
+  ai_access_save_failed:
+    en: "Failed to save the AI access policy: %{error}"
+    zh-CN: "AI 访问策略保存失败：%{error}"
+    zh-HK: "AI 存取策略儲存失敗：%{error}"
+  ai_access_storage_missing:
+    en: Local connection storage is unavailable, so the AI access policy could not be saved
+    zh-CN: 本地连接存储不可用，AI 访问策略未保存
+    zh-HK: 本機連線儲存不可用，AI 存取策略未儲存
   copy_connection:
     en: Copy Connection
     zh-CN: 复制连接
