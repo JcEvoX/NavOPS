@@ -10474,6 +10474,7 @@ dependencies = [
 name = "process-util"
 version = "0.15.2"
 dependencies = [
+ "dirs 6.0.0",
  "tokio",
 ]
 
