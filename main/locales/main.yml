@@ -3427,9 +3427,13 @@ Settings:
         zh-CN: 外部 MCP 客户端通过 npx 启动 @navop/mcp@latest；npm 按需解析并缓存当前包，无需从扩展市场安装
         zh-HK: 外部 MCP 客戶端透過 npx 啟動 @navop/mcp@latest；npm 按需解析並快取目前套件，無需從擴充功能市集安裝
       runtime_requirements_ready:
-        en: "%{package} will run on demand through %{command}; no global npm install is required"
-        zh-CN: "%{package} 将通过 %{command} 按需启动；无需全局安装 npm 包"
-        zh-HK: "%{package} 將透過 %{command} 按需啟動；無需全域安裝 npm 套件"
+        en: "%{command} found at %{path}; %{package} runs on demand through it and needs no global npm install"
+        zh-CN: "已找到 %{command}：%{path}；%{package} 将通过它按需启动，无需全局安装 npm 包"
+        zh-HK: "已找到 %{command}：%{path}；%{package} 將透過它按需啟動，無需全域安裝 npm 套件"
+      runtime_requirements_missing:
+        en: "%{command} was not found; install Node.js or add its bin directory to PATH before installing MCP client configs or the Navop Skill"
+        zh-CN: "未找到 %{command}；请先安装 Node.js，或把 Node.js 的 bin 目录加入 PATH，再安装 MCP 客户端配置或 Navop Skill"
+        zh-HK: "未找到 %{command}；請先安裝 Node.js，或把 Node.js 的 bin 目錄加入 PATH，再安裝 MCP 客戶端配置或 Navop Skill"
       install_codex_config:
         en: Codex MCP Configuration
         zh-CN: Codex MCP 配置
@@ -3483,9 +3487,9 @@ Settings:
         zh-CN: 为 Agents 安装 Navop Skill
         zh-HK: 為 Agents 安裝 Navop Skill
       install_skill_desc:
-        en: Install the Skill from @navop/cli@latest into the user Skill directory; npm downloads it on demand and Navop does not use a shell
-        zh-CN: 从 @navop/cli@latest 安装到用户 Skill 目录；npm 按需下载，Navop 不通过 shell 执行
-        zh-HK: 從 @navop/cli@latest 安裝到使用者 Skill 目錄；npm 按需下載，Navop 不透過 shell 執行
+        en: Install the Skill from @navop/cli@latest into the user Skill directory; Navop locates npx itself, including Homebrew and version-manager directories that GUI processes cannot see
+        zh-CN: 从 @navop/cli@latest 安装到用户 Skill 目录；Navop 会自动定位 npx，包括 GUI 进程看不到的 Homebrew、版本管理器目录
+        zh-HK: 從 @navop/cli@latest 安裝到使用者 Skill 目錄；Navop 會自動定位 npx，包括 GUI 進程看不到的 Homebrew、版本管理器目錄
       skill_status_installed:
         en: "Installed at %{path}; use Update to explicitly replace it with the recommended package copy"
         zh-CN: "已安装到 %{path}；点击更新才会明确替换为推荐 npm 包中的版本"
@@ -3514,6 +3518,10 @@ Settings:
         en: "Failed to install Navop Skill: %{error}"
         zh-CN: "Navop Skill 安装失败：%{error}"
         zh-HK: "Navop Skill 安裝失敗：%{error}"
+      skill_install_launcher_missing:
+        en: "Failed to install Navop Skill: %{command} was not found. Install Node.js or add Node.js to the app PATH."
+        zh-CN: "Navop Skill 安装失败：未找到 %{command}。请安装 Node.js，或将 Node.js 的 bin 目录加入 PATH。"
+        zh-HK: "Navop Skill 安裝失敗：未找到 %{command}。請安裝 Node.js，或將 Node.js 的 bin 目錄加入 PATH。"
       install_client_config_success:
         en: "MCP client config installed: %{path}"
         zh-CN: "MCP 客户端配置已安装：%{path}"
