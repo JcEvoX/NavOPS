@@ -4,6 +4,28 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 <!-- NAVOP_RELEASES -->
 
+## [v0.21.1] - 2026-10-22
+
+#### 修复与优化
+
+- 连接表单：SSH、MySQL、Redis、MongoDB 表单里的「AI 访问」一行不再显示成 `ConnectionForm.ai_access` 这样的原始键名。此前四个 crate 各自拼这个 i18n 键，而语言包里只有提供该组件的 crate 定义了它，rust-i18n 查不到就把键名原样渲染出来；现在统一走 `connection_form` 的共享文案，并新增全仓契约测试守住同类漏键（同时修掉另外 16 处失效键，包括保存失败提示、文件操作、锁屏提示与 FTP 弹窗标题）。
+- 数据库：Auto（粘性）会话的空闲断连自愈改为「执行前探活」，不再在收到 `connection closed` 后重放整段脚本——同一句文案既可能表示请求没发出去，也可能表示语句已被服务端执行，重放就有重复写入的风险。现在取连接先本地判死（PostgreSQL）或有界 `ping`（MySQL 走驱动级 `COM_PING`），判死即就地重连，语句只在重连后的新连接上发出一次；服务端尚未恢复时建连上限也收紧到 10 秒，不至于每次执行都等满默认超时（#433、#447）。
+- 数据库：粘性会话与手动事务不再被后台清理强拆——页签钉住的会话挂机 30 分钟后首次执行不再报 `Session not found`，手动事务也不会被静默回滚，页签关闭时仍照常释放。
+- 设置：`settings.json` 解析失败时不再静默回落默认值、再被下一次保存全量覆盖。坏文件会先改名保留为 `settings.json.corrupt-<时间戳>` 便于定位是哪个字段解析失败，保存改为「临时文件 + rename」原子写并在覆盖前留一份 `.bak`；同时先按磁盘上的日志路径装好日志再加载设置，让解析错误真正落进日志文件。
+
+国内下载：如果 GitHub 下载较慢，可从 [CNB 镜像](https://cnb.cool/navop-dev/navop/-/releases/tag/v0.21.1) 下载桌面端安装包
+
+---
+
+#### Fixes and Improvements
+
+- Connection forms: the "AI Access" row in the SSH, MySQL, Redis and MongoDB forms no longer renders as a raw key such as `ConnectionForm.ai_access`. Each of those four crates assembled the i18n key by itself while only the crate that provides the widget defines it, so rust-i18n returned the key verbatim; the row now uses the shared text from `connection_form`, and a repository-wide contract test guards against the same class of miss (16 other broken keys are fixed as well, including the save-failure notice, file actions, the session lock banners and the FTP dialog titles).
+- Database: Auto (sticky) sessions now self-heal by probing the connection before running instead of replaying the batch after a `connection closed`. That single message can mean either "the request never left the client" or "the statement already ran on the server", so replaying risked duplicate writes. A pooled connection is now checked locally (PostgreSQL) or with a bounded `ping` (MySQL uses the driver-level `COM_PING`) and replaced in place when dead, so the statement goes out exactly once on the new connection; the connect timeout is also clamped to 10 seconds while the server stays down, instead of letting every run wait out the default timeout (#433, #447).
+- Database: sticky sessions and manual transactions are no longer torn down by background cleanup — a tab-pinned session idle for 30 minutes no longer fails its first run with `Session not found` and a manual transaction is not silently rolled back, while closing the tab still releases it.
+- Settings: a `settings.json` that fails to parse is no longer silently replaced by defaults and then overwritten wholesale by the next save. The bad file is renamed to `settings.json.corrupt-<timestamp>` so the offending field can be identified, saving is atomic (temp file + rename) with a `.bak` copy of the previous version, and logging is configured from the on-disk log path before settings load so the parse error actually reaches the log file.
+
+**Full Changelog**: https://github.com/feigeCode/navop/compare/v0.21.0...v0.21.1
+
 ## [v0.21.0] - 2026-10-22
 
 #### 更新内容
