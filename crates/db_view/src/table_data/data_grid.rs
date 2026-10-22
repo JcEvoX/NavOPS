@@ -3863,6 +3863,7 @@ impl DataGrid {
                 transactional: true,
                 max_rows: None,
                 streaming: false,
+                reconnect_on_lost_connection: false,
             };
 
             let result = global_state
@@ -4014,6 +4015,7 @@ impl DataGrid {
                 transactional: true,
                 max_rows: None,
                 streaming: false,
+                reconnect_on_lost_connection: false,
             };
 
             let result = global_state
@@ -4209,6 +4211,7 @@ impl DataGrid {
             transactional: true,
             max_rows: None,
             streaming: false,
+            reconnect_on_lost_connection: false,
         };
 
         global_state

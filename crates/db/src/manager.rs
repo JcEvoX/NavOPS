@@ -14,7 +14,7 @@ use crate::ipc::{ExternalDatabasePlugin, IpcDriverRegistry};
 use crate::mssql::MsSqlPlugin;
 use crate::mysql::MySqlPlugin;
 use crate::oracle::OraclePlugin;
-use crate::plugin::DatabasePlugin;
+use crate::plugin::{ConnectionLifecycle, DatabasePlugin};
 use crate::plugin_manifest::DatabaseCapabilities;
 use crate::postgresql::PostgresPlugin;
 use crate::runtime_contract::require_tokio_runtime;
@@ -31,6 +31,7 @@ use one_core::connection_notifier::{
 use one_core::gpui_tokio::Tokio;
 use one_core::storage::{ConnectionRepository, DatabaseType, DbConnectionConfig};
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::sync::{Arc, Mutex as StdMutex};
 
 type ExternalRegistryReloader = dyn Fn() -> IpcDriverRegistry + Send + Sync;
@@ -298,6 +299,11 @@ struct ConnectionSession {
     session_id: String,
     state: StdMutex<SessionState>,
     identity: StdMutex<DatabaseIdentity>,
+    /// Schema 最近一次成功对齐到这条物理连接的记录（`switch_session_schema`）。
+    ///
+    /// 粘性会话重连后必须在新连接上重放，否则未限定表名的查询会悄悄退回服务端
+    /// 默认 schema —— 与 issue #433 是同一类问题。
+    applied_schema: StdMutex<Option<String>>,
 }
 
 /// Mutable per-session bookkeeping kept separate from the connection lock.
@@ -399,6 +405,7 @@ impl ConnectionSession {
                 last_active: now,
             }),
             identity: StdMutex::new(identity),
+            applied_schema: StdMutex::new(None),
         }
     }
 
@@ -423,6 +430,31 @@ impl ConnectionSession {
     /// Whether the cached identity says this session can serve `config`.
     fn can_serve(&self, config: &DbConnectionConfig) -> bool {
         self.identity().matches(config)
+    }
+
+    /// 记住最近一次对齐到这条物理连接的 schema；`None` 表示清空（会话被复用）。
+    fn remember_schema(&self, schema: Option<&str>) {
+        *self
+            .applied_schema
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = schema.map(str::to_string);
+    }
+
+    fn applied_schema(&self) -> Option<String> {
+        self.applied_schema
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// 原地换掉物理连接，会话 id、池内位置和 `close_on_release` 都不变。
+    ///
+    /// 断连重连必须保持会话身份：持有它的页签（粘性查询会话、手动事务、表数据
+    /// 会话）都按 session id 取连接，换 id 会连带丢掉它们的状态。
+    async fn replace_connection(&self, connection: Box<dyn DbConnection + Send + Sync>) {
+        let mut guard = self.lock_connection().await;
+        *guard = connection;
+        self.refresh_identity(&**guard);
     }
 
     /// Hand the session to a statement that is about to take its connection.
@@ -693,6 +725,53 @@ impl ConnectionManager {
         Some(lock.lock_owned().await)
     }
 
+    /// 断连后就地重建一条会话的物理连接。
+    ///
+    /// 会话 id、池内位置、`close_on_release` 和缓存的 identity 都不变，持有它的
+    /// 页签（粘性查询会话、手动事务、表数据会话）因此不需要重建。旧连接在断连时
+    /// 已经被驱动判死，直接 drop 交给 socket 回收：死连接不会回包，优雅
+    /// `disconnect` 只会把重连拖满 [`network_deadline::DISCONNECT_TIMEOUT`]。
+    ///
+    /// `open` 收到的是活连接上的 config（包含页签切换过的 database），负责建好并
+    /// 返回新连接。会话上记录的 schema 会在换入新连接前重放。
+    pub async fn reconnect_session<F, Fut>(
+        &self,
+        session_id: &str,
+        lifecycle: ConnectionLifecycle,
+        open: F,
+    ) -> Result<(), DbError>
+    where
+        F: FnOnce(DbConnectionConfig) -> Fut,
+        Fut: Future<Output = Result<Box<dyn DbConnection + Send + Sync>, DbError>>,
+    {
+        let session = self
+            .find_session(session_id)
+            .await
+            .ok_or_else(|| DbError::Internal(format!("session not found: {}", session_id)))?;
+
+        let config = {
+            let connection = session.lock_connection().await;
+            connection.config().clone()
+        };
+        let config = self.config_resolver.resolve(config)?;
+
+        let _physical_open_guard = self
+            .physical_open_guard(lifecycle.physical_open_lock_key.as_deref())
+            .await;
+        let connection = open(config).await?;
+
+        if let Some(schema) = session.applied_schema() {
+            connection.switch_schema(&schema).await?;
+        }
+        let database = connection.config().database.clone();
+        session.replace_connection(connection).await;
+        info!(
+            "Reconnected lost session: {} (database: {:?})",
+            session_id, database
+        );
+        Ok(())
+    }
+
     /// Get exclusive access to a session's connection for one statement
     ///
     /// The pool lock is only held long enough to locate the session and claim it;
@@ -850,6 +929,9 @@ impl ConnectionManager {
                 "Reusing session: {} (database: {:?})",
                 session_id, config.database
             );
+            // 新的使用方会自己对位 schema：清掉上一位使用者留下的记录，避免把别人的
+            // schema 在重连时重放到这条连接上。
+            session.remember_schema(None);
             return Ok(Some(session_id));
         }
     }
@@ -1112,6 +1194,15 @@ pub struct DbConnectionSummary {
     pub name: String,
     pub database_type: DatabaseType,
     pub database: Option<String>,
+}
+
+/// 这批结果是否全部是“连接在语句发送前就已断开”，即一行都没落到数据库。
+///
+/// 只有这种情况才能安全重试：驱动在本地就确认连接死了，语句从未到达服务端。
+/// 中途断连（`broken pipe` / `unexpected EOF` / `connection reset`）可能已经写成功，
+/// 重放会造成重复执行，所以必须返回 `false`。
+fn statements_never_sent(results: &[SqlResult]) -> bool {
+    !results.is_empty() && results.iter().all(SqlResult::connection_lost_before_send)
 }
 
 /// Global database state - stores DbManager and ConnectionManager
@@ -2044,22 +2135,79 @@ impl GlobalDbState {
         opts: Option<ExecOptions>,
     ) -> anyhow::Result<Vec<SqlResult>> {
         require_tokio_runtime("database session execution")?;
+        let opts = opts.unwrap_or_default();
+        let results = self.run_session_script(&session_id, &script, &opts).await?;
+
+        // 空闲期被中间设备或服务端丢掉的连接不会回包：驱动在语句发出前就报
+        // `connection closed`，这一次执行一行都没落到数据库。调用方允许时（粘性
+        // 查询会话）就地重连这条会话再试一次，页签不必“关闭连接再打开”。
+        //
+        // 显式事务不重试：新连接没有事务上下文，静默重跑会把语句挪到事务外。
+        if !opts.reconnect_on_lost_connection || !statements_never_sent(&results) {
+            return Ok(results);
+        }
+
+        match self.reconnect_lost_session(&session_id).await {
+            Ok(()) => {}
+            Err(error) => {
+                // 重连失败（网络还没恢复）时把第一次的真实错误交给 UI，
+                // 下一次执行会再试。
+                warn!(
+                    "Failed to reconnect lost session {}, surfacing the original error: {}",
+                    session_id, error
+                );
+                return Ok(results);
+            }
+        }
+
+        warn!(
+            "Session {} connection was already closed; reconnected it and retried the statement",
+            session_id
+        );
+        self.run_session_script(&session_id, &script, &opts).await
+    }
+
+    /// 在一条会话上执行脚本，不处理断连重试。
+    async fn run_session_script(
+        &self,
+        session_id: &str,
+        script: &str,
+        opts: &ExecOptions,
+    ) -> anyhow::Result<Vec<SqlResult>> {
         let config = self
             .connection_manager
-            .get_session_config(&session_id)
+            .get_session_config(session_id)
             .await
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
         let plugin = self.get_plugin(&config.database_type)?;
         let mut guard = self
             .connection_manager
-            .get_session_connection(&session_id)
+            .get_session_connection(session_id)
             .await?;
         let conn = guard
             .connection()
             .ok_or_else(|| anyhow::anyhow!("Session connection not found"))?;
-        conn.execute(plugin.as_ref(), &script, opts.unwrap_or_default())
+        conn.execute(plugin.as_ref(), script, opts.clone())
             .await
             .map_err(|e| anyhow::anyhow!("{}", e))
+    }
+
+    /// 就地重建一条会话的物理连接（会话 id 不变）。
+    async fn reconnect_lost_session(&self, session_id: &str) -> anyhow::Result<()> {
+        let config = self
+            .connection_manager
+            .get_session_config(session_id)
+            .await
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {}", session_id))?;
+        let plugin = self.get_plugin(&config.database_type)?;
+        let lifecycle = plugin.connection_lifecycle(&config);
+        let open_plugin = Arc::clone(&plugin);
+        self.connection_manager
+            .reconnect_session(session_id, lifecycle, move |config| async move {
+                open_plugin.create_connection(config).await
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("{}", error))
     }
 
     /// Execute SQL on an existing session from a GPUI async task.
@@ -2136,16 +2284,24 @@ impl GlobalDbState {
         schema: String,
     ) -> anyhow::Result<()> {
         require_tokio_runtime("database session schema switch")?;
-        let mut guard = self
-            .connection_manager
-            .get_session_connection(&session_id)
-            .await?;
-        let conn = guard
-            .connection()
-            .ok_or_else(|| anyhow::anyhow!("Session connection not found"))?;
-        conn.switch_schema(&schema)
-            .await
-            .map_err(|error| anyhow::anyhow!("{}", error))
+        {
+            let mut guard = self
+                .connection_manager
+                .get_session_connection(&session_id)
+                .await?;
+            let conn = guard
+                .connection()
+                .ok_or_else(|| anyhow::anyhow!("Session connection not found"))?;
+            conn.switch_schema(&schema)
+                .await
+                .map_err(|error| anyhow::anyhow!("{}", error))?;
+        }
+        // 记住对齐过的 schema：会话断连重连后要在新连接上重放，
+        // 否则未限定表名的查询会退回服务端默认 schema（issue #433 的同一类问题）。
+        if let Some(session) = self.connection_manager.find_session(&session_id).await {
+            session.remember_schema(Some(&schema));
+        }
+        Ok(())
     }
 
     pub async fn list_databases_direct(
@@ -6549,6 +6705,154 @@ mod tests {
         manager.close_session(&second_session).await.unwrap();
 
         assert_eq!(1, max_active_opens.load(Ordering::SeqCst));
+    }
+
+    fn error_result(message: &str) -> SqlResult {
+        SqlResult::Error(SqlErrorInfo {
+            sql: "SELECT 1".to_string(),
+            message: message.to_string(),
+        })
+    }
+
+    /// 只有“连接在语句发送前就已断开”的结果才能重试。
+    ///
+    /// 中途断连（broken pipe / unexpected EOF）可能已经写成功，重放会重复执行；
+    /// 普通 SQL 错误（语法、约束）更不是断连。
+    #[test]
+    fn statements_never_sent_only_trusts_pre_send_disconnects() {
+        let closed = error_result("connection closed");
+        assert!(statements_never_sent(&[closed.clone(), closed.clone()]));
+
+        assert!(!statements_never_sent(&[]), "没有结果时不能当成断连");
+        assert!(
+            !statements_never_sent(&[
+                closed.clone(),
+                error_result("relation \"users\" does not exist"),
+            ]),
+            "混入真正执行过的语句就不能整体重放"
+        );
+        assert!(
+            !statements_never_sent(&[error_result(
+                "error communicating with the server: broken pipe"
+            )]),
+            "中途断连无法判断语句是否执行，不能重试"
+        );
+    }
+
+    /// 断连后的粘性会话就地重连：会话 id 和池内位置不变，换的只是物理连接。
+    #[tokio::test]
+    async fn reconnect_session_replaces_the_physical_connection_in_place() {
+        let mut state = GlobalDbState::new();
+        let config = test_config("reconnect-in-place");
+        state.register_connection(config.clone());
+        let session_id = format!("{}:session:1", config.id);
+
+        let disconnects = Arc::new(AtomicUsize::new(0));
+        let stale =
+            MockConnection::with_disconnect_count(config.clone(), false, Arc::clone(&disconnects));
+        state
+            .connection_manager
+            .sessions
+            .write()
+            .await
+            .entry(config.id.clone())
+            .or_default()
+            .push(Arc::new(ConnectionSession::new(
+                Box::new(stale),
+                session_id.clone(),
+                false,
+            )));
+
+        state
+            .connection_manager
+            .reconnect_session(
+                &session_id,
+                ConnectionLifecycle::default(),
+                |_config| async {
+                    Ok(Box::new(MockConnection::new(config.clone(), true))
+                        as Box<dyn DbConnection + Send + Sync>)
+                },
+            )
+            .await
+            .expect("lost session should reconnect");
+
+        {
+            let sessions = state.connection_manager.sessions.read().await;
+            let pooled: Vec<String> = sessions
+                .get(&config.id)
+                .expect("session stays pooled under the same connection")
+                .iter()
+                .map(|session| session.session_id.clone())
+                .collect();
+            assert_eq!(vec![session_id.clone()], pooled, "重连不该换会话 id");
+        }
+
+        let mut guard = state
+            .connection_manager
+            .get_session_connection(&session_id)
+            .await
+            .expect("reconnected session should still be acquirable");
+        let healthy = guard
+            .connection()
+            .expect("session keeps a connection")
+            .query("SELECT 1")
+            .await
+            .expect("query on the reconnected session");
+        assert!(
+            !healthy.is_error(),
+            "池里应该已经换成新连接，而不是那条报 connection closed 的死连接"
+        );
+
+        assert_eq!(
+            0,
+            disconnects.load(Ordering::SeqCst),
+            "死连接不回包，重连不该再去优雅 disconnect 它"
+        );
+    }
+
+    /// 重连要把会话上记住的 schema 重放到新连接上，否则查询会退回默认 schema。
+    #[tokio::test]
+    async fn reconnect_session_replays_the_session_schema() {
+        let mut state = GlobalDbState::new();
+        let config = test_config("reconnect-replay-schema");
+        state.register_connection(config.clone());
+        let session_id = format!("{}:session:1", config.id);
+        let session = Arc::new(ConnectionSession::new(
+            Box::new(MockConnection::new(config.clone(), true)),
+            session_id.clone(),
+            false,
+        ));
+        session.remember_schema(Some("analytics"));
+        state
+            .connection_manager
+            .sessions
+            .write()
+            .await
+            .entry(config.id.clone())
+            .or_default()
+            .push(Arc::clone(&session));
+
+        let switched = Arc::new(StdMutex::new(Vec::new()));
+        let recorder = Arc::clone(&switched);
+        state
+            .connection_manager
+            .reconnect_session(
+                &session_id,
+                ConnectionLifecycle::default(),
+                move |_config| {
+                    let mut fresh = MockConnection::new(config.clone(), true);
+                    fresh.switched_schemas = Some(Arc::clone(&recorder));
+                    async move { Ok(Box::new(fresh) as Box<dyn DbConnection + Send + Sync>) }
+                },
+            )
+            .await
+            .expect("lost session should reconnect");
+
+        assert_eq!(
+            vec!["analytics".to_string()],
+            switched.lock().unwrap().clone(),
+            "新连接上要重新对齐会话的 schema"
+        );
     }
 }
 
