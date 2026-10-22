@@ -93,6 +93,15 @@ pub fn ai_access_label() -> String {
     t!("ConnectionForm.ai_access").to_string()
 }
 
+/// 连接已落库、只有「AI 访问策略」没写进去时的提示文案。
+///
+/// 各连接表单都从这里取文案：`t!` 只查**调用方 crate** 的语言包，同一句译文若要每个表单
+/// 各写一份 key，就会漏掉其中一两个（曾因此把 `ConnectionForm.ai_access` 原样显示到界面上）。
+/// 保存失败的类型在各表单并不统一（`String` / `anyhow::Error`），所以按 `Display` 接收。
+pub fn ai_access_save_failed(error: impl std::fmt::Display) -> String {
+    t!("ConnectionForm.ai_access_save_failed", error = error).to_string()
+}
+
 /// 「AI 访问」三档选择器：所有连接表单共用的通用组件。
 ///
 /// 表单只持有一个 `Entity<AiAccessLevel>`，渲染时把实体交给本组件；选项顺序、文案、

@@ -826,8 +826,7 @@ impl MiddlewareConnectionForm {
                             });
                         }
                         Err(error) => {
-                            let message = t!("ConnectionForm.ai_access_save_failed", error = error)
-                                .to_string();
+                            let message = crate::ai_access::ai_access_save_failed(&error);
                             let _ = this.update(cx, |form, cx| {
                                 form.set_save_error(message.clone(), cx);
                                 cx.emit(MiddlewareFormEvent::SaveError(message));

@@ -511,6 +511,14 @@ impl ConnectionSession {
         Arc::clone(&self.connection).lock_owned().await
     }
 
+    /// Try to lock the connection without waiting; `Err(())` when a statement is
+    /// holding it (the connection is busy and therefore alive).
+    fn try_lock_connection(
+        &self,
+    ) -> Result<OwnedMutexGuard<Box<dyn DbConnection + Send + Sync>>, ()> {
+        Arc::clone(&self.connection).try_lock_owned().map_err(|_| ())
+    }
+
     /// Validate that this session can serve `config` before it is reused.
     ///
     /// Takes the connection lock, so the caller must not hold the session table lock.
@@ -589,9 +597,9 @@ pub struct ConnectionManager {
     /// Converts stored connection configs into runtime configs before opening sessions.
     config_resolver: ConnectionConfigResolver,
     /// Connection idle timeout (default: 5 minutes)
-    idle_timeout: Duration,
+    pub(crate) idle_timeout: Duration,
     /// Maximum connection lifetime (default: 30 minutes)
-    max_lifetime: Duration,
+    pub(crate) max_lifetime: Duration,
     /// Session counter for generating unique IDs
     session_counter: Arc<tokio::sync::Mutex<u64>>,
 }
@@ -1078,8 +1086,14 @@ impl ConnectionManager {
                 let mut i = 0;
                 while i < session_list.len() {
                     let session = &session_list[i];
-                    let should_remove = session.is_expired(idle_timeout)
-                        || session.is_lifetime_expired(max_lifetime);
+                    // lifetime 到期的在用会话不强拆：粘性查询/手动事务页签钉着它，
+                    // 摘除会让下一次执行报 `Session not found`（事务还会被静默回滚）。
+                    // 被钉住的会话由执行入口的前置探测处理：连接死了就地重连，
+                    // 活着就继续用（粘性会话的连接级状态比 lifetime 策略更重要）。
+                    // idle 超时已由 `is_expired` 内的 `in_flight == 0` 保护。
+                    let should_remove =
+                        (session.is_expired(idle_timeout) && !session.in_use())
+                            || (session.is_lifetime_expired(max_lifetime) && !session.in_use());
 
                     if should_remove {
                         let session = session_list.remove(i);
@@ -1196,13 +1210,13 @@ pub struct DbConnectionSummary {
     pub database: Option<String>,
 }
 
-/// 这批结果是否全部是“连接在语句发送前就已断开”，即一行都没落到数据库。
-///
-/// 只有这种情况才能安全重试：驱动在本地就确认连接死了，语句从未到达服务端。
-/// 中途断连（`broken pipe` / `unexpected EOF` / `connection reset`）可能已经写成功，
-/// 重放会造成重复执行，所以必须返回 `false`。
-fn statements_never_sent(results: &[SqlResult]) -> bool {
-    !results.is_empty() && results.iter().all(SqlResult::connection_lost_before_send)
+/// 会话探活结果（`GlobalDbState::probe_session_dead`）。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionLiveness {
+    /// 连接可用（或无法判定：正忙于执行说明活着，驱动不支持探活则保守执行）。
+    Alive,
+    /// 连接已死：语句从未发出，可以安全地就地重连后执行。
+    Dead,
 }
 
 /// Global database state - stores DbManager and ConnectionManager
@@ -2136,35 +2150,77 @@ impl GlobalDbState {
     ) -> anyhow::Result<Vec<SqlResult>> {
         require_tokio_runtime("database session execution")?;
         let opts = opts.unwrap_or_default();
-        let results = self.run_session_script(&session_id, &script, &opts).await?;
 
-        // 空闲期被中间设备或服务端丢掉的连接不会回包：驱动在语句发出前就报
-        // `connection closed`，这一次执行一行都没落到数据库。调用方允许时（粘性
-        // 查询会话）就地重连这条会话再试一次，页签不必“关闭连接再打开”。
+        // 粘性查询会话的发送前自愈（参考 dbx 的 checkout 健康检查）：
+        // 执行前探活一次，连接已死就地重连后再执行。因为语句此时必然
+        // 尚未发出，重连后的执行不足重放，天然不会重复写入。
         //
-        // 显式事务不重试：新连接没有事务上下文，静默重跑会把语句挪到事务外。
-        if !opts.reconnect_on_lost_connection || !statements_never_sent(&results) {
-            return Ok(results);
-        }
-
-        match self.reconnect_lost_session(&session_id).await {
-            Ok(()) => {}
-            Err(error) => {
-                // 重连失败（网络还没恢复）时把第一次的真实错误交给 UI，
-                // 下一次执行会再试。
-                warn!(
-                    "Failed to reconnect lost session {}, surfacing the original error: {}",
-                    session_id, error
-                );
-                return Ok(results);
+        // 探活两段式：驱动本地判死（零网络往返，如 PG 的请求通道关闭）→
+        // 有界 ping（死连接不回包也不会挂死）。拿不到连接锁说明正在执行
+        // 语句，连接显然活着，直接执行。
+        //
+        // 执行后的错误**不再触发重试**：无论文案是什么，都无法区分语句是否
+        // 已被服务端执行；只靠 `looks_like_connection_lost` 让持有方在下一
+        // 次执行前重建会话（而下次执行又会走到这里的探活）。
+        //
+        // 显式事务不走此路径：新连接没有事务上下文，重跑会把语句挪到事务外。
+        if opts.reconnect_on_lost_connection
+            && self.probe_session_dead(&session_id).await == SessionLiveness::Dead
+        {
+            match self.reconnect_lost_session(&session_id).await {
+                Ok(()) => warn!(
+                    "Session {} connection was dead before send (liveness probe); \
+                     reconnected it in place and will run the script",
+                    session_id
+                ),
+                Err(error) => {
+                    // 重连失败（网络还没恢复）：照常执行，把死连接的真实错误
+                    // 交给 UI；探活信号让持有方下次执行前重建。
+                    warn!(
+                        "Failed to reconnect dead session {}, will run on the stale \
+                         connection and surface its real error: {}",
+                        session_id, error
+                    );
+                }
             }
         }
 
-        warn!(
-            "Session {} connection was already closed; reconnected it and retried the statement",
-            session_id
-        );
         self.run_session_script(&session_id, &script, &opts).await
+    }
+
+    /// 执行前的两段式探活：本地判死（零网络往返）→ 驱动不支持时退回有界 ping。
+    ///
+    /// 不 await 连接锁（那会排在长语句后面）：拿不到锁视为活着。ping 用
+    /// `network_deadline::VALIDATE_PING_TIMEOUT` 做上界，空闲期被中间设备
+    /// 丢弃的连接不会回包，但会在超时后判死而不是挂死。
+    ///
+    /// 设计取舍（参考 dbx 的 checkout 健康检查）：ping 是统一可用的权威信号，
+    /// 但对已死连接要白等一个超时；驱动本地判死（如 PG 的请求通道关闭）
+    /// 零成本且权威，能命中就跳过 ping。两者是 or 关系：任一判死即 Dead。
+    async fn probe_session_dead(&self, session_id: &str) -> SessionLiveness {
+        let Some(session) = self.connection_manager.find_session(session_id).await else {
+            return SessionLiveness::Alive; // 会话不存在由执行路径报 Session not found
+        };
+        let Ok(guard) = session.try_lock_connection() else {
+            return SessionLiveness::Alive; // 正在执行语句：连接显然活着
+        };
+        // 第一段：驱动本地判死（零网络往返、权威）。`None` 表示驱动不支持。
+        if guard.connection_closed_locally() == Some(true) {
+            return SessionLiveness::Dead;
+        }
+        // 第二段：有界 ping。锁已被第一段确保空闲，这里不会再等长语句。
+        let alive = network_deadline::bound(
+            "session liveness ping",
+            network_deadline::VALIDATE_PING_TIMEOUT,
+            guard.ping(),
+        )
+        .await
+        .is_ok();
+        if alive {
+            SessionLiveness::Alive
+        } else {
+            SessionLiveness::Dead
+        }
     }
 
     /// 在一条会话上执行脚本，不处理断连重试。
@@ -2193,6 +2249,26 @@ impl GlobalDbState {
     }
 
     /// 就地重建一条会话的物理连接（会话 id 不变）。
+    /// 重连探测的上限：探测性质的建连不该让用户等默认 connect_timeout
+    /// （MySQL 默认 30s）；服务端真起不来时快速失败，把第一次的真实错误
+    /// 尽快交给 UI。
+    const RECONNECT_PROBE_CONNECT_TIMEOUT_SECS: u64 = 10;
+
+    /// 重连探测的 connect_timeout 钳制（纯函数，便于契约测试）：
+    /// 只缩短不放大（用户显式配置的更短值保留），未配置时设为探测上限。
+    fn clamp_reconnect_probe_timeout(config: DbConnectionConfig) -> DbConnectionConfig {
+        let mut probe_config = config;
+        let clamped = probe_config
+            .get_param_as::<u64>("connect_timeout")
+            .map_or(Self::RECONNECT_PROBE_CONNECT_TIMEOUT_SECS, |configured| {
+                configured.min(Self::RECONNECT_PROBE_CONNECT_TIMEOUT_SECS)
+            });
+        probe_config
+            .extra_params
+            .insert("connect_timeout".to_string(), clamped.to_string());
+        probe_config
+    }
+
     async fn reconnect_lost_session(&self, session_id: &str) -> anyhow::Result<()> {
         let config = self
             .connection_manager
@@ -2204,7 +2280,8 @@ impl GlobalDbState {
         let open_plugin = Arc::clone(&plugin);
         self.connection_manager
             .reconnect_session(session_id, lifecycle, move |config| async move {
-                open_plugin.create_connection(config).await
+                let probe_config = Self::clamp_reconnect_probe_timeout(config);
+                open_plugin.create_connection(probe_config).await
             })
             .await
             .map_err(|error| anyhow::anyhow!("{}", error))
@@ -4414,6 +4491,8 @@ mod tests {
         streaming_results: Option<Vec<SqlResult>>,
         /// 模拟空闲期被中间设备丢弃的 TCP 连接：任何网络调用永远挂起。
         dead_socket: bool,
+        /// 模拟驱动本地判死（`connection_closed_locally` 返回 Some(true)）。
+        locally_closed: bool,
     }
 
     impl MockConnection {
@@ -4430,6 +4509,7 @@ mod tests {
                 streaming_dropped: None,
                 streaming_results: None,
                 dead_socket: false,
+                locally_closed: false,
             }
         }
 
@@ -4450,12 +4530,23 @@ mod tests {
                 streaming_dropped: None,
                 streaming_results: None,
                 dead_socket: false,
+                locally_closed: false,
             }
         }
 
         fn with_dead_socket(config: DbConnectionConfig) -> Self {
             Self {
                 dead_socket: true,
+                ..Self::new(config, true)
+            }
+        }
+
+        /// 模拟驱动本地判死：任何执行都返回裸 `connection closed`（读取侧无法
+        /// 区分是否已发出），但 `connection_closed_locally` 能探出连接已死。
+        fn with_locally_closed(config: DbConnectionConfig) -> Self {
+            Self {
+                healthy: false,
+                locally_closed: true,
                 ..Self::new(config, true)
             }
         }
@@ -4476,6 +4567,7 @@ mod tests {
                 streaming_dropped: None,
                 streaming_results: None,
                 dead_socket: false,
+                locally_closed: false,
             }
         }
 
@@ -4495,6 +4587,7 @@ mod tests {
                 streaming_dropped: None,
                 streaming_results: None,
                 dead_socket: false,
+                locally_closed: false,
             }
         }
 
@@ -4516,6 +4609,7 @@ mod tests {
                 streaming_dropped: None,
                 streaming_results: None,
                 dead_socket: false,
+                locally_closed: false,
             }
         }
 
@@ -4537,6 +4631,7 @@ mod tests {
                 streaming_dropped: Some(streaming_dropped),
                 streaming_results: None,
                 dead_socket: false,
+                locally_closed: false,
             }
         }
 
@@ -4556,6 +4651,7 @@ mod tests {
                 streaming_dropped: None,
                 streaming_results: Some(streaming_results),
                 dead_socket: false,
+                locally_closed: false,
             }
         }
     }
@@ -4568,6 +4664,8 @@ mod tests {
         open_started: Arc<tokio::sync::Notify>,
         created_configs: Option<Arc<StdMutex<Vec<DbConnectionConfig>>>>,
         metadata_calls: Option<Arc<StdMutex<Vec<&'static str>>>>,
+        /// 前 N 次 create_connection 返回本地判死的死连接。
+        dead_opens: Option<Arc<AtomicUsize>>,
     }
 
     impl SlowOpenPlugin {
@@ -4605,6 +4703,7 @@ mod tests {
                 open_started,
                 created_configs: None,
                 metadata_calls: None,
+                dead_opens: None,
             }
         }
 
@@ -4617,6 +4716,17 @@ mod tests {
                 Arc::new(tokio::sync::Notify::new()),
             );
             plugin.created_configs = Some(created_configs);
+            plugin
+        }
+
+        /// 首次建连返回驱动本地判死的死连接，重连后远回活连接：
+        /// 验证 `execute_session` 的前置探测 + 就地重连重放。
+        fn reconnecting_postgres(
+            created_configs: Arc<StdMutex<Vec<DbConnectionConfig>>>,
+            dead_opens: Arc<AtomicUsize>,
+        ) -> Self {
+            let mut plugin = Self::recording_postgres(created_configs);
+            plugin.dead_opens = Some(dead_opens);
             plugin
         }
 
@@ -4652,6 +4762,11 @@ mod tests {
         ) -> Result<Box<dyn DbConnection + Send + Sync>, DbError> {
             if let Some(created_configs) = &self.created_configs {
                 created_configs.lock().unwrap().push(config.clone());
+            }
+            if let Some(dead_opens) = &self.dead_opens {
+                if dead_opens.fetch_sub(1, Ordering::SeqCst) > 0 {
+                    return Ok(Box::new(MockConnection::with_locally_closed(config)));
+                }
             }
             let active = self.active_opens.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active_opens.fetch_max(active, Ordering::SeqCst);
@@ -4939,6 +5054,12 @@ mod tests {
             &self.config
         }
 
+        /// 模拟驱动本地判死：探活接口能确认连接已死，但执行后的错误文案
+        /// 只是裸 `connection closed`（无法区分是否已发出）。
+        fn connection_closed_locally(&self) -> Option<bool> {
+            Some(self.locally_closed)
+        }
+
         fn set_config_database(&mut self, database: Option<String>) {
             self.config.database = database;
         }
@@ -4972,6 +5093,14 @@ mod tests {
             }
             if let Some(executed_sql) = &self.executed_sql {
                 executed_sql.lock().unwrap().push(script.to_string());
+            }
+            if !self.healthy {
+                // 死连接：PG/MySQL 都把断连包成 Ok(Error{...})，裸文案无法
+                // 区分语句是否已发出。
+                return Ok(vec![SqlResult::Error(SqlErrorInfo {
+                    sql: script.to_string(),
+                    message: "connection closed".to_string(),
+                })]);
             }
             Ok(vec![SqlResult::Exec(ExecResult {
                 sql: script.to_string(),
@@ -6714,29 +6843,33 @@ mod tests {
         })
     }
 
-    /// 只有“连接在语句发送前就已断开”的结果才能重试。
-    ///
-    /// 中途断连（broken pipe / unexpected EOF）可能已经写成功，重放会重复执行；
-    /// 普通 SQL 错误（语法、约束）更不是断连。
+    /// 执行后的错误文案不再参与任何重试决策（重试只发生在执行前的探活），
+    /// 但 `looks_like_connection_lost` 仍要为 UI 的「下次重建会话」信号服务：
+    /// 断连类文案要命中，普通 SQL 错误不能命中，否则会在错误上反复重建会话。
     #[test]
-    fn statements_never_sent_only_trusts_pre_send_disconnects() {
-        let closed = error_result("connection closed");
-        assert!(statements_never_sent(&[closed.clone(), closed.clone()]));
-
-        assert!(!statements_never_sent(&[]), "没有结果时不能当成断连");
-        assert!(
-            !statements_never_sent(&[
-                closed.clone(),
-                error_result("relation \"users\" does not exist"),
-            ]),
-            "混入真正执行过的语句就不能整体重放"
-        );
-        assert!(
-            !statements_never_sent(&[error_result(
-                "error communicating with the server: broken pipe"
-            )]),
-            "中途断连无法判断语句是否执行，不能重试"
-        );
+    fn connection_lost_signal_classifies_post_execution_errors() {
+        for message in [
+            "connection closed",
+            "error communicating with the server: broken pipe",
+            "connection reset by peer",
+            "Lost connection to MySQL server during query",
+            "client is closed",
+        ] {
+            assert!(
+                error_result(message).looks_like_connection_lost(),
+                "{message} 应当让持有方下次执行前重建会话"
+            );
+        }
+        for message in [
+            "relation \"users\" does not exist",
+            "You have an error in your SQL syntax",
+            "canceling statement due to statement timeout",
+        ] {
+            assert!(
+                !error_result(message).looks_like_connection_lost(),
+                "{message} 是普通 SQL 错误，不能触发会话重建"
+            );
+        }
     }
 
     /// 断连后的粘性会话就地重连：会话 id 和池内位置不变，换的只是物理连接。
@@ -6852,6 +6985,264 @@ mod tests {
             vec!["analytics".to_string()],
             switched.lock().unwrap().clone(),
             "新连接上要重新对齐会话的 schema"
+        );
+    }
+
+    /// 执行前驱动本地判死的粘性会话：execute_session 应就地重连重放一次，
+    /// 用户一次点击自愈，不需要第二次执行。
+    ///
+    /// 死连接的执行结果只是裸 `connection closed`（无法区分语句是否已发出），
+    /// 单靠文案不能重放；安全信号来自 `connection_closed_locally` 的前置探测。
+    #[tokio::test]
+    async fn execute_session_reconnects_and_replays_a_locally_closed_session() {
+        let mut state = GlobalDbState::new();
+        let config = test_config("reconnect-local-probe");
+        state.register_connection(config.clone());
+        let created_configs = Arc::new(StdMutex::new(Vec::new()));
+        // 首次建连返回本地判死的死连接，重连后是活连接。
+        state.db_manager.postgresql = Arc::new(SlowOpenPlugin::reconnecting_postgres(
+            Arc::clone(&created_configs),
+            Arc::new(AtomicUsize::new(1)),
+        ));
+
+        let session_id = state
+            .connection_manager
+            .create_session(config.clone(), &state.db_manager)
+            .await
+            .expect("session should be created on the dead connection");
+
+        let results = state
+            .execute_session(
+                session_id.clone(),
+                "select 1".to_string(),
+                Some(ExecOptions {
+                    reconnect_on_lost_connection: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("execution should succeed after in-place reconnect");
+
+        assert_eq!(
+            2,
+            created_configs.lock().unwrap().len(),
+            "死连接应就地重连一次（首次建连 + 重连）"
+        );
+        assert_eq!(
+            1,
+            results.len(),
+            "重放后应返回新连接上的执行结果"
+        );
+        assert!(!results[0].is_error(), "重放应在新活连接上成功");
+    }
+
+    /// 探活的 or 语义：驱动本地判死命中时跳过 ping（零网络往返等待）；
+    /// 驱动不支持本地判死时 ping 判死。两者任一命中即 Dead。
+    /// `with_locally_closed` 的 mock 同时 unhealthy：ping 也会失败，因此用
+    /// 「无本地信号 + unhealthy（ping 失败）」验证第二段，「本地判死」验证第一段。
+    #[tokio::test]
+    async fn liveness_probe_is_local_check_or_ping() {
+        // 第二段：无本地判死信号（默认 None），ping 失败判死。
+        // MockConnection::new(_, healthy=false) 的 connection_closed_locally
+        // 返回 Some(false)，ping（走 query）返回错误。
+        let mut state = GlobalDbState::new();
+        let config = test_config("probe-ping-branch");
+        state.register_connection(config.clone());
+        state.db_manager.postgresql = Arc::new(SlowOpenPlugin::recording_postgres(Arc::new(
+            StdMutex::new(Vec::new()),
+        )));
+        let session_id = format!("{}:session:1", config.id);
+        {
+            let mut sessions = state.connection_manager.sessions.write().await;
+            sessions.entry(config.id.clone()).or_default().push(Arc::new(
+                ConnectionSession::new(
+                    Box::new(MockConnection::new(config.clone(), false)),
+                    session_id.clone(),
+                    false,
+                ),
+            ));
+        }
+        assert_eq!(
+            SessionLiveness::Dead,
+            state.probe_session_dead(&session_id).await,
+            "无本地信号时 ping 失败应判死"
+        );
+
+        // 活连接两段都不命中。
+        let config_live = test_config("probe-alive");
+        state.register_connection(config_live.clone());
+        let live_session_id = format!("{}:session:1", config_live.id);
+        {
+            let mut sessions = state.connection_manager.sessions.write().await;
+            sessions.entry(config_live.id.clone()).or_default().push(Arc::new(
+                ConnectionSession::new(
+                    Box::new(MockConnection::new(config_live.clone(), true)),
+                    live_session_id.clone(),
+                    false,
+                ),
+            ));
+        }
+        assert_eq!(
+            SessionLiveness::Alive,
+            state.probe_session_dead(&live_session_id).await,
+            "活连接探活必须返回 Alive，不得误判触发无谓重连"
+        );
+    }
+
+    /// 探活不到 + 执行后才拿到裸 `connection closed`（PG/MySQL 断连的实际形态）
+    /// 时，连接已在前置探活阶段被判死并重连，语句只在重连后的新连接上发出
+    /// 一次——不存在「重放已执行语句」的窗口。若探活被禁用（非粘性会话），
+    /// 错误只作为结果行返回，配合 UI 信号在下次执行前重建。
+    #[tokio::test]
+    async fn execute_session_probes_and_reconnects_a_bare_closed_connection() {
+        let mut state = GlobalDbState::new();
+        let config = test_config("reconnect-bare-closed");
+        state.register_connection(config.clone());
+        let created_configs = Arc::new(StdMutex::new(Vec::new()));
+        state.db_manager.postgresql = Arc::new(SlowOpenPlugin::recording_postgres(
+            Arc::clone(&created_configs),
+        ));
+        // 手插 unhealthy 死连接（ping 会失败）：断连的真实形态。
+        let session_id = format!("{}:session:1", config.id);
+        {
+            let mut sessions = state.connection_manager.sessions.write().await;
+            sessions.entry(config.id.clone()).or_default().push(Arc::new(
+                ConnectionSession::new(
+                    Box::new(MockConnection::new(config.clone(), false)),
+                    session_id.clone(),
+                    false,
+                ),
+            ));
+        }
+
+        let results = state
+            .execute_session(
+                session_id.clone(),
+                "update t set a = 1".to_string(),
+                Some(ExecOptions {
+                    reconnect_on_lost_connection: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect("transport should stay Ok");
+
+        assert_eq!(
+            1,
+            created_configs.lock().unwrap().len(),
+            "探活判死应就地重连一次，语句只在新连接上发出"
+        );
+        assert!(
+            !results.iter().any(SqlResult::is_error),
+            "重连后执行应成功，不重放旧错误"
+        );
+    }
+
+    /// 非粘性会话（探活未启用）拿到裸 `connection closed` 时不得重连：
+    /// 错误照常返回，由持有方决定后续。
+    #[tokio::test]
+    async fn execute_session_without_reconnect_flag_surfaces_the_error() {
+        let mut state = GlobalDbState::new();
+        let config = test_config("reconnect-flag-off");
+        state.register_connection(config.clone());
+        let created_configs = Arc::new(StdMutex::new(Vec::new()));
+        state.db_manager.postgresql = Arc::new(SlowOpenPlugin::recording_postgres(
+            Arc::clone(&created_configs),
+        ));
+        let session_id = format!("{}:session:1", config.id);
+        {
+            let mut sessions = state.connection_manager.sessions.write().await;
+            sessions.entry(config.id.clone()).or_default().push(Arc::new(
+                ConnectionSession::new(
+                    Box::new(MockConnection::new(config.clone(), false)),
+                    session_id.clone(),
+                    false,
+                ),
+            ));
+        }
+
+        let results = state
+            .execute_session(session_id.clone(), "update t set a = 1".to_string(), None)
+            .await
+            .expect("transport should stay Ok; the error is a result row");
+
+        assert_eq!(
+            0,
+            created_configs.lock().unwrap().len(),
+            "未启用探活重连的调用方不应触发重连"
+        );
+        assert!(
+            results.iter().any(SqlResult::looks_like_connection_lost),
+            "结果仍应暴露连接级错误，让持有方下次执行前重建会话"
+        );
+    }
+
+    /// lifetime 到期但被页签钉住（in_use）的会话不得被 cleanup 强拆；
+    /// 改为在下次执行入口就地平滑换新连接，页签无感。
+    #[tokio::test]
+    async fn cleanup_does_not_evict_pinned_lifetime_expired_sessions() {
+        let mut state = GlobalDbState::new();
+        state.connection_manager.idle_timeout = Duration::from_secs(3600);
+        state.connection_manager.max_lifetime = Duration::ZERO; // 立即 lifetime 到期
+        let config = test_config("lifetime-pinned");
+        state.register_connection(config.clone());
+        let session = Arc::new(ConnectionSession::new(
+            Box::new(MockConnection::new(config.clone(), true)),
+            format!("{}:session:1", config.id),
+            false,
+        ));
+        // 页签钉住：in_flight > 0（粘性会话的真实状态）
+        session.mark_in_use();
+        state
+            .connection_manager
+            .sessions
+            .write()
+            .await
+            .entry(config.id.clone())
+            .or_default()
+            .push(Arc::clone(&session));
+
+        state.connection_manager.cleanup_expired_sessions().await;
+
+        let pooled = state
+            .connection_manager
+            .sessions
+            .read()
+            .await
+            .get(&config.id)
+            .map(|list| list.len())
+            .unwrap_or(0);
+        assert_eq!(1, pooled, "in_use 会话 lifetime 到期也不得从池里摘除");
+    }
+
+    /// 重连是探测性质的建连：connect_timeout 必须被钳制在短上限内，
+    /// 且只缩短不放大（用户显式配置的更短值保留）。直接测生产纯函数。
+    #[test]
+    fn reconnect_probe_config_clamps_connect_timeout() {
+        let clamp = |configured: Option<u64>| {
+            let mut params = std::collections::HashMap::new();
+            if let Some(value) = configured {
+                params.insert("connect_timeout".to_string(), value.to_string());
+            }
+            let config = DbConnectionConfig {
+                extra_params: params,
+                ..test_config("reconnect-clamp")
+            };
+            GlobalDbState::clamp_reconnect_probe_timeout(config)
+                .get_param_as::<u64>("connect_timeout")
+                .expect("钳制后必须显式携带 connect_timeout")
+        };
+
+        assert_eq!(
+            GlobalDbState::RECONNECT_PROBE_CONNECT_TIMEOUT_SECS,
+            clamp(Some(30)),
+            "默认 30s 必须被钳到探测上限"
+        );
+        assert_eq!(5, clamp(Some(5)), "用户显式配置的更短超时必须保留");
+        assert_eq!(
+            GlobalDbState::RECONNECT_PROBE_CONNECT_TIMEOUT_SECS,
+            clamp(None),
+            "未配置时也要有探测上限，而不是驱动默认的无限等待"
         );
     }
 }
