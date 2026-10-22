@@ -1,13 +1,20 @@
 use std::collections::{HashMap, HashSet};
 
 use gpui::{Entity, Window};
-use gpui_component::menu::{PopupMenu, PopupMenuItem};
+use gpui_component::{
+    WindowExt as _,
+    menu::{PopupMenu, PopupMenuItem},
+    notification::Notification,
+};
 use one_assets::IconName;
 use one_core::{
-    storage::{ConnectionType, StoredConnection, Workspace},
+    storage::{
+        ConnectionRepository, ConnectionType, GlobalStorageState, StoredConnection, Workspace,
+    },
     tab_container::TabOpenMode,
 };
 use rust_i18n::t;
+use tool_runtime::AiAccessLevel;
 
 use super::{
     connection_copy_menu::append_copy_connection_submenu,
@@ -59,12 +66,25 @@ pub(crate) fn build_connection_context_menu(
         resolved_ssh: resolved_ssh.as_ref(),
         home: &home,
     };
-    for action in connection_menu_actions(
+    let actions = connection_menu_actions(
         connection.connection_type,
         can_edit,
         connection.preferred_open_mode,
-    ) {
+    );
+    // 「AI 访问」是一个设置项，固定放在「打开」类动作之后、「管理」类动作之前。
+    let action_count = actions.len();
+    let ai_access_section = actions
+        .iter()
+        .position(|action| starts_menu_section(*action))
+        .unwrap_or(action_count);
+    for (index, action) in actions.into_iter().enumerate() {
+        if index == ai_access_section {
+            menu = append_ai_access_submenu(menu, connection_id, &home, window, cx);
+        }
         menu = add_connection_action(menu, action, &action_context, window, cx);
+    }
+    if ai_access_section == action_count {
+        menu = append_ai_access_submenu(menu, connection_id, &home, window, cx);
     }
     menu
 }
@@ -118,6 +138,79 @@ fn add_connection_action(
             action_context.home,
         )),
     }
+}
+
+/// 「AI 访问」子菜单：快捷切换三档策略（issue #437）。
+fn append_ai_access_submenu(
+    menu: PopupMenu,
+    connection_id: i64,
+    home: &Entity<crate::home_tab::HomePage>,
+    window: &mut Window,
+    cx: &mut gpui::Context<PopupMenu>,
+) -> PopupMenu {
+    let current = super::load_ai_access_level(connection_id, cx);
+    let home = home.clone();
+    menu.submenu_with_icon(
+        Some(IconName::Ai.into()),
+        t!("Connection.ai_access").to_string(),
+        window,
+        cx,
+        move |mut submenu, _window, _cx| {
+            for level in connection_form::ai_access::all_levels() {
+                let home = home.clone();
+                submenu = submenu.item(
+                    PopupMenuItem::new(ai_access_menu_label(level))
+                        .checked(level == current)
+                        .on_click(move |_, window, cx| {
+                            apply_ai_access_level(&home, connection_id, level, window, cx);
+                        }),
+                );
+            }
+            submenu
+        },
+    )
+}
+
+/// 菜单项文案：与侧栏徽标同在 `Connection.ai_access_*` 命名空间下。
+fn ai_access_menu_label(level: AiAccessLevel) -> String {
+    match level {
+        AiAccessLevel::Allowed => t!("Connection.ai_access_allowed").to_string(),
+        AiAccessLevel::ReadOnly => t!("Connection.ai_access_read_only").to_string(),
+        AiAccessLevel::Denied => t!("Connection.ai_access_denied").to_string(),
+    }
+}
+
+/// 写策略并给出可见反馈：失败必须弹通知，不能让「限制没生效」被静默吞掉。
+fn apply_ai_access_level(
+    home: &Entity<crate::home_tab::HomePage>,
+    connection_id: i64,
+    level: AiAccessLevel,
+    window: &mut Window,
+    cx: &mut gpui::App,
+) {
+    match write_ai_access_level(connection_id, level, cx) {
+        // 侧栏/列表/卡片都在观察 HomePage，notify 会顺带让它们重读策略。
+        Ok(()) => home.update(cx, |_, cx| cx.notify()),
+        Err(error) => {
+            let message = t!("Connection.ai_access_save_failed", error = error).to_string();
+            window.push_notification(Notification::error(message).autohide(true), cx);
+        }
+    }
+}
+
+fn write_ai_access_level(
+    connection_id: i64,
+    level: AiAccessLevel,
+    cx: &gpui::App,
+) -> Result<(), String> {
+    let storage = cx
+        .try_global::<GlobalStorageState>()
+        .map(|state| state.storage.clone())
+        .ok_or_else(|| t!("Connection.ai_access_storage_missing").to_string())?;
+    let repo = storage
+        .get::<ConnectionRepository>()
+        .ok_or_else(|| t!("Connection.ai_access_storage_missing").to_string())?;
+    connection_form::ai_access::write_level(&repo, connection_id, level)
 }
 
 fn connection_menu_item(
