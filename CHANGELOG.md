@@ -4,6 +4,18 @@ Navop user-facing release notes. Generate and review each bilingual version entr
 
 <!-- NAVOP_RELEASES -->
 
+## [Unreleased]
+
+#### 修复与优化
+
+- 个人同步：修复引用了钥匙串凭据的连接在多设备间持续产生假冲突的问题。连接载荷里的凭据引用导出时保留了源设备的本地整数 ID，而每台设备的行号各不相同，导致同一条连接跨设备的 checksum 永不相等，被判定为「双方都改过」而反复冲突、来回覆盖。现在导出载荷统一只保留跨设备稳定的 `credential_cloud_id`，整数 ID 置零（下载时仍按云端 ID 映射回本机行号，行为不变）。
+
+---
+
+#### Fixes and Improvements
+
+- Personal sync: fixed constantly recurring false conflicts for connections that reference keychain credentials. The exported payload kept the source device's local integer credential ID, which differs on every device, so the same logical connection never produced an equal checksum across devices and was repeatedly flagged as "modified on both sides", overwriting back and forth. Exports now carry only the device-stable `credential_cloud_id` with the integer ID zeroed (downloads still map the cloud ID back to the local row, unchanged behavior).
+
 ## [v0.21.1] - 2026-10-22
 
 #### 修复与优化
